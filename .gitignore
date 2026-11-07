@@ -1,9 +1,7 @@
-**/bin/
-**/obj/
-publish/
-.vs/
-*.user
-*.log
+/target/
+/publish/
 checkpoints.json
 checkpoints.json.*.tmp
 logs/
+*.pdb
+*.log
