@@ -2,7 +2,7 @@ using System.Text.Json;
 
 static class Program
 {
-    public const string Version = "2.2";
+    public const string Version = "2.2.1";
     [STAThread]
     static void Main(string[] args)
     {
@@ -74,6 +74,17 @@ static class Program
         Directory.CreateDirectory(directory);
         var library = new Library(Path.Combine(directory, "library.json"));
         var point = new Position(102000, -52.5983f, -60.5875f, 53.9973f, 0.2393f);
+        if (Library.DefaultPath != Path.Combine(AppContext.BaseDirectory, "checkpoints.json"))
+            throw new Exception("Default storage is not in the application folder.");
+        var unnamed = new Library(Path.Combine(directory, "unnamed.json"));
+        if (unnamed.UniqueName("   ") != "Location 1") throw new Exception("Blank name did not receive a default.");
+        unnamed.Change(data => data.Locations.Add(new Checkpoint(Guid.NewGuid(), unnamed.UniqueName(""), point, DateTimeOffset.Now)));
+        unnamed.Change(data => data.Locations.Add(new Checkpoint(Guid.NewGuid(), "Location 3", point, DateTimeOffset.Now)));
+        string collision = unnamed.UniqueName("");
+        if (collision != "Location 3 (1)") throw new Exception("Automatic name collision was not resolved.");
+        unnamed.Change(data => data.Locations.Add(new Checkpoint(Guid.NewGuid(), collision, point, DateTimeOffset.Now)));
+        unnamed.Load();
+        if (unnamed.Data.Locations.Count != 3) throw new Exception("Unnamed locations were not saved.");
         var item = new Checkpoint(Guid.NewGuid(), "Unicode çãõ", point, DateTimeOffset.Now);
         library.Change(data => { data.Quick = point; data.Locations.Add(item); });
         var loaded = new Library(Path.Combine(directory, "library.json"));
@@ -108,10 +119,12 @@ static class Program
         string support = Path.Combine(directory, "support-test.log");
         SupportLog.Export(support, "Self-test snapshot");
         string report = File.ReadAllText(support);
+        if (!File.Exists(Path.Combine(AppContext.BaseDirectory, "logs", "teleport.log")))
+            throw new Exception("Log was not saved in the application folder.");
         if (!report.Contains("System.IO.InvalidDataException") || !report.Contains("SelfTest = Full exception details"))
             throw new Exception("Support log did not retain full error details.");
         File.WriteAllText(Path.Combine(directory, "result.txt"),
-            "PASS - save/load, quick checkpoint, UTF-8, import/export, duplicate handling, invalid-change preservation.");
+            "PASS - portable paths, optional names, name collisions, save/load, quick checkpoint, UTF-8, import/export, duplicate handling, invalid-change preservation, support log.");
     }
     static async Task VerifyTravel(string destination)
     {

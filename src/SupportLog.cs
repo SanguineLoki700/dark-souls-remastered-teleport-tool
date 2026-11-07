@@ -8,8 +8,7 @@ static class SupportLog
 {
     static readonly object Gate = new();
     static readonly Queue<string> Fallback = new();
-    static readonly string Folder = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DarkSoulsCheckpoints", "logs");
+    static readonly string Folder = Path.Combine(AppContext.BaseDirectory, "logs");
     static string Current => Path.Combine(Folder, "teleport.log");
 
     public static void Event(string text) => Write("INFO", text);

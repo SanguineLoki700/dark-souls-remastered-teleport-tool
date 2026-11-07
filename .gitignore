@@ -4,3 +4,6 @@ publish/
 .vs/
 *.user
 *.log
+checkpoints.json
+checkpoints.json.*.tmp
+logs/

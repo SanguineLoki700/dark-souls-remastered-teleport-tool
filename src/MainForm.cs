@@ -398,16 +398,7 @@ sealed class MainForm : Form
         catch (Exception error) { ReportError("Capture checkpoint", error); }
     }
     string UniqueName(string title, Guid? except = null)
-    {
-        if (string.IsNullOrWhiteSpace(title)) title = "Local " + (library.Data.Locations.Count + 1);
-        var names = library.Data.Locations.Where(item => item.Id != except)
-            .Select(item => item.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        string result = title.Trim();
-        int suffix = 1;
-        while (names.Contains(result))
-            result = $"{title.Trim()} ({suffix++})";
-        return result;
-    }
+        => library.UniqueName(title, except);
     async Task Save()
     {
         var checkpoint = new Checkpoint(Guid.NewGuid(), UniqueName(name.Text), CapturePosition(), DateTimeOffset.Now);
@@ -529,7 +520,7 @@ sealed class MainForm : Form
     }
     async Task Import()
     {
-        using var dialog = new OpenFileDialog { Filter = "Locations (*.json)|*.json", Title = "Import locations" };
+        using var dialog = new OpenFileDialog { Filter = "Locations (*.json)|*.json", Title = "Import locations", InitialDirectory = AppContext.BaseDirectory };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         string path = dialog.FileName;
         int added = 0;
@@ -544,7 +535,7 @@ sealed class MainForm : Form
         using var dialog = new SaveFileDialog
         {
             Filter = "Locations (*.json)|*.json", FileName = "dark-souls-locations.json",
-            Title = "Export locations", AddExtension = true, DefaultExt = "json"
+            Title = "Export locations", AddExtension = true, DefaultExt = "json", InitialDirectory = AppContext.BaseDirectory
         };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         string path = dialog.FileName;
@@ -604,7 +595,7 @@ sealed class MainForm : Form
         {
             using var dialog = new SaveFileDialog
             {
-                Filter = "Support log (*.log)|*.log", FileName = "dark-souls-teleport-support.log",
+                Filter = "Support log (*.log)|*.log", FileName = "dark-souls-teleport-support.log", InitialDirectory = AppContext.BaseDirectory,
                 DefaultExt = "log", AddExtension = true
             };
             if (dialog.ShowDialog(window) != DialogResult.OK) return;

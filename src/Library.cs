@@ -14,9 +14,18 @@ sealed class Library
     public string FilePath => path;
     public LibraryData Data { get; private set; } = new();
     public Library(string path) { this.path = path; }
-    public static string DefaultPath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "DarkSoulsCheckpoints", "checkpoints.json");
+    public static string DefaultPath => Path.Combine(AppContext.BaseDirectory, "checkpoints.json");
+
+    public string UniqueName(string title, Guid? except = null)
+    {
+        if (string.IsNullOrWhiteSpace(title)) title = "Location " + (Data.Locations.Count + 1);
+        var names = Data.Locations.Where(item => item.Id != except)
+            .Select(item => item.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        string result = title.Trim();
+        int suffix = 1;
+        while (names.Contains(result)) result = $"{title.Trim()} ({suffix++})";
+        return result;
+    }
 
     public void Load()
     {

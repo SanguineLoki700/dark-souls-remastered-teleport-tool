@@ -34,7 +34,7 @@ sealed class PointEditor : Form
         BackColor = Theme.Ink;
         ForeColor = Theme.Text;
         Font = Theme.CreateFont(19);
-        Label("Location name", 30, 27, 430, 24);
+        Label("Location name (optional)", 30, 27, 430, 24);
         name.SetBounds(30, 56, 430, 28);
         name.Text = title;
         name.BackColor = Color.FromArgb(34, 35, 30);
@@ -91,7 +91,6 @@ sealed class PointEditor : Form
         try
         {
             _ = Position;
-            if (LocationName.Length == 0) { name.Focus(); feedback.Text = "Enter a name for this location."; return; }
             DialogResult = DialogResult.OK;
         }
         catch (Exception error) { feedback.Text = error.Message; }
