@@ -931,7 +931,6 @@ impl Popup {
             let lines = SendMessageW(input, EM_GETLINECOUNT, 0, 0);
             ShowScrollBar(input, SB_VERT, (lines > 12) as i32);
             for (id, label, r) in [
-                (323, "Licenses", rect(375, 298, 85, 22)),
                 (320, "Save support log", rect(30, 322, 180, 38)),
                 (321, "Reconnect", rect(220, 322, 110, 38)),
                 (322, "Close", rect(340, 322, 120, 38)),
@@ -1045,33 +1044,7 @@ impl Popup {
             return;
         }
         if self.diagnostics {
-            if id == 323 {
-                let button = GetDlgItem(self.hwnd, 323);
-                let showing = text(button) == "Back";
-                let body = if showing {
-                    self.diagnostic_text.clone()
-                } else {
-                    format!(
-                        "{}\r\n\r\n{}",
-                        include_str!("../assets/FONT-LICENSE.txt"),
-                        include_str!("../assets/THIRD-PARTY-NOTICES.txt")
-                    )
-                };
-                let input = GetDlgItem(self.hwnd, 310);
-                SendMessageW(input, EM_SETLIMITTEXT, 0x7ffffffe, 0);
-                SetWindowTextW(input, wide(&body).as_ptr());
-                SendMessageW(input, EM_SETSEL, 0, 0);
-                SendMessageW(input, EM_SCROLLCARET, 0, 0);
-                ShowScrollBar(
-                    input,
-                    SB_VERT,
-                    (!showing || SendMessageW(input, EM_GETLINECOUNT, 0, 0) > 12) as i32,
-                );
-                SetWindowTextW(
-                    button,
-                    wide(if showing { "Licenses" } else { "Back" }).as_ptr(),
-                );
-            } else if id == 320 {
+            if id == 320 {
                 if let Some(path) = file_dialog(self.hwnd, true, true) {
                     let _ = self.commands.send(Command::SupportLog(path));
                     self.feedback = "Support log requested.".into();
@@ -1578,19 +1551,6 @@ fn run_inner(testing: bool) -> Result<(), String> {
                 }
                 if diagnostic && text(control) != ui.view.diagnostics {
                     return Err("Diagnostics text was lost.".into());
-                }
-                if diagnostic {
-                    let popup = GetWindowLongPtrW(dialog, GWLP_USERDATA) as *mut Popup;
-                    (*popup).command(323);
-                    if !text(control).contains("SIL OPEN FONT LICENSE")
-                        || text(control).len() < 700000
-                    {
-                        return Err("Embedded license text was truncated.".into());
-                    }
-                    (*popup).command(323);
-                    if text(control) != ui.view.diagnostics {
-                        return Err("Returning from licenses lost Diagnostics.".into());
-                    }
                 }
                 if diagnostic {
                     check_edit_selection(control)?;
