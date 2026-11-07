@@ -16,6 +16,8 @@ Download the ZIP from [Releases](https://github.com/SanguineLoki700/dark-souls-r
 
 For bug reports, open **Diagnostics**, click **Save support log**, and attach the log. Tested with 100,000 locations and live travel between separate maps.
 
+The ZIP contains the executable and one LICENSES.txt file with the font and library notices.
+
 Version 2.3.4 fixes destinations being overwritten during map loading, list flicker, button styling and Ctrl+A in text fields. Locations now highlight under the mouse. Firelink Altar and Sanctuary Garden were tested in both directions.
 
 Build on Windows with Rust and the MSVC build tools:
