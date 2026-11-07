@@ -164,6 +164,12 @@ impl State {
         self.view.page = 0;
         self.query.clear();
         self.filter();
+        support::log(format!(
+            "Location saved: total={} visible={} file={}",
+            self.view.total,
+            self.view.rows.len(),
+            self.library.path.display()
+        ));
         Ok(())
     }
     fn command(&mut self, command: Command) -> Result<String, String> {
@@ -338,7 +344,12 @@ fn worker(rx: Receiver<Command>, events: Sender<Event>) {
         Ok(()) => {
             state.loaded = true;
             state.filter();
-            state.quick()
+            state.quick();
+            support::log(format!(
+                "Locations loaded: total={} file={}",
+                state.view.total,
+                state.library.path.display()
+            ));
         }
         Err(e) => {
             support::log(format!("Load error: {e}"));
@@ -456,6 +467,22 @@ pub fn self_test(dir: &Path) -> Result<(), String> {
         loaded: true,
         last_attach: Instant::now(),
     };
+    let large_library = std::mem::replace(
+        &mut state.library,
+        Library::new(dir.join("save-three.json")),
+    );
+    for name in ["First", "Second", ""] {
+        state.command(Command::ManualSave(name.into(), point))?;
+    }
+    if state.view.total != 3 || state.view.rows.len() != 3 {
+        return Err("Saving a third location cleared the visible list.".into());
+    }
+    state.library.load()?;
+    state.filter();
+    if state.view.total != 3 || state.view.rows.len() != 3 {
+        return Err("Reopening lost saved locations.".into());
+    }
+    state.library = large_library;
     state.filter();
     if state.view.rows.len() != 50 || state.view.pages != 2000 {
         return Err("Large-library pagination failed".into());

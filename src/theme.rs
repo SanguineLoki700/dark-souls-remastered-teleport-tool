@@ -52,7 +52,7 @@ impl Bitmap {
             },
             ..Default::default()
         };
-        let old_stretch=SetStretchBltMode(dc,HALFTONE as i32);
+        let old_stretch = SetStretchBltMode(dc, HALFTONE as i32);
         StretchDIBits(
             dc,
             d.0,
@@ -68,7 +68,9 @@ impl Bitmap {
             DIB_RGB_COLORS,
             SRCCOPY,
         );
-        if old_stretch!=0{SetStretchBltMode(dc,old_stretch);}
+        if old_stretch != 0 {
+            SetStretchBltMode(dc, old_stretch);
+        }
     }
 }
 fn load(data: &[u8]) -> RgbaImage {
@@ -95,44 +97,135 @@ fn overlay(
     imageops::overlay(target, &resized, d.0 as i64, d.1 as i64);
 }
 
+struct AlphaSurface {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+}
+impl AlphaSurface {
+    unsafe fn new(source: &RgbaImage, w: i32, h: i32) -> Option<Self> {
+        let image = imageops::resize(source, w as u32, h as u32, FilterType::Lanczos3);
+        let pixels: Vec<u8> = image
+            .pixels()
+            .flat_map(|p| [p[2].min(p[3]), p[1].min(p[3]), p[0].min(p[3]), p[3]])
+            .collect();
+        let dc = CreateCompatibleDC(null_mut());
+        if dc.is_null() {
+            return None;
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = null_mut();
+        let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if bitmap.is_null() || bits.is_null() {
+            if !bitmap.is_null() {
+                DeleteObject(bitmap);
+            }
+            DeleteDC(dc);
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
+        let previous = SelectObject(dc, bitmap);
+        Some(Self {
+            dc,
+            bitmap,
+            previous,
+        })
+    }
+}
+impl Drop for AlphaSurface {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.dc);
+        }
+    }
+}
+struct Sprite {
+    source: RgbaImage,
+    surfaces: HashMap<(i32, i32), AlphaSurface>,
+}
+impl Sprite {
+    fn new(mut image: RgbaImage) -> Self {
+        for p in image.pixels_mut() {
+            let alpha = p[3] as u16;
+            for c in 0..3 {
+                p[c] = (p[c] as u16 * alpha / 255) as u8;
+            }
+        }
+        Self {
+            source: image,
+            surfaces: HashMap::new(),
+        }
+    }
+    unsafe fn draw(&mut self, dc: HDC, x: i32, y: i32, w: i32, h: i32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let key = (w, h);
+        if !self.surfaces.contains_key(&key) {
+            if let Some(surface) = AlphaSurface::new(&self.source, w, h) {
+                self.surfaces.insert(key, surface);
+            } else {
+                return;
+            }
+        }
+        let surface = &self.surfaces[&key];
+        GdiAlphaBlend(
+            dc,
+            x,
+            y,
+            w,
+            h,
+            surface.dc,
+            0,
+            0,
+            w,
+            h,
+            BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            },
+        );
+    }
+}
 struct GameFrame {
-    tl: Bitmap,
-    tr: Bitmap,
-    bl: Bitmap,
-    br: Bitmap,
-    left: Bitmap,
-    right: Bitmap,
-    top: Bitmap,
-    bottom: Bitmap,
+    left: Sprite,
+    right: Sprite,
+    top: Sprite,
+    bottom: Sprite,
 }
 impl GameFrame {
     fn new() -> Self {
         Self {
-            tl: Bitmap::new(load(include_bytes!("../assets/frame-tl.png"))),
-            tr: Bitmap::new(load(include_bytes!("../assets/frame-tr.png"))),
-            bl: Bitmap::new(load(include_bytes!("../assets/frame-bl.png"))),
-            br: Bitmap::new(load(include_bytes!("../assets/frame-br.png"))),
-            left: Bitmap::new(load(include_bytes!("../assets/frame-left.png"))),
-            right: Bitmap::new(load(include_bytes!("../assets/frame-right.png"))),
-            top: Bitmap::new(load(include_bytes!("../assets/frame-top.png"))),
-            bottom: Bitmap::new(load(include_bytes!("../assets/frame-bottom.png"))),
+            left: Sprite::new(load(include_bytes!("../assets/frame-left.png"))),
+            right: Sprite::new(load(include_bytes!("../assets/frame-right.png"))),
+            top: Sprite::new(load(include_bytes!("../assets/frame-top.png"))),
+            bottom: Sprite::new(load(include_bytes!("../assets/frame-bottom.png"))),
         }
     }
-    unsafe fn draw(&self, dc: HDC, r: RECT) {
+    unsafe fn draw(&mut self, dc: HDC, r: RECT) {
         let w = r.right - r.left;
         let h = r.bottom - r.top;
-        let ch = 16.min((h / 2 - 1).max(1));
-        let cw = (ch * 82 / 96).min(w / 2).max(1);
-        let line = 3.min(ch);
-        self.top.draw(dc, r.left + cw, r.top, w - 2 * cw, line);
-        self.bottom
-            .draw(dc, r.left + cw, r.bottom - line, w - 2 * cw, line);
-        self.left.draw(dc, r.left, r.top + ch, 2, h - 2 * ch);
-        self.right.draw(dc, r.right - 2, r.top + ch, 2, h - 2 * ch);
-        self.tl.draw(dc, r.left, r.top, cw, ch);
-        self.tr.draw(dc, r.right - cw, r.top, cw, ch);
-        self.bl.draw(dc, r.left, r.bottom - ch, cw, ch);
-        self.br.draw(dc, r.right - cw, r.bottom - ch, cw, ch);
+        let line = 2.min(h / 2);
+        self.top.draw(dc, r.left, r.top, w, line);
+        self.bottom.draw(dc, r.left, r.bottom - line, w, line);
+        self.left.draw(dc, r.left, r.top + line, 1, h - 2 * line);
+        self.right
+            .draw(dc, r.right - 1, r.top + line, 1, h - 2 * line);
     }
 }
 pub struct Theme {
@@ -354,6 +447,47 @@ impl Theme {
             .draw(dc, r.left, r.top, r.right - r.left, r.bottom - r.top);
     }
     pub unsafe fn button(
+        &mut self,
+        dc: HDC,
+        r: RECT,
+        active: bool,
+        text: &str,
+        size: i32,
+        enabled: bool,
+    ) {
+        let width = r.right - r.left;
+        let height = r.bottom - r.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let memory = CreateCompatibleDC(dc);
+        let bitmap = if memory.is_null() {
+            null_mut()
+        } else {
+            CreateCompatibleBitmap(dc, width, height)
+        };
+        if memory.is_null() || bitmap.is_null() {
+            if !memory.is_null() {
+                DeleteDC(memory);
+            }
+            self.paint_button(dc, r, active, text, size, enabled);
+            return;
+        }
+        let previous = SelectObject(memory, bitmap);
+        self.paint_button(
+            memory,
+            rect(0, 0, width, height),
+            active,
+            text,
+            size,
+            enabled,
+        );
+        BitBlt(dc, r.left, r.top, width, height, memory, 0, 0, SRCCOPY);
+        SelectObject(memory, previous);
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+    }
+    unsafe fn paint_button(
         &mut self,
         dc: HDC,
         r: RECT,

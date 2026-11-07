@@ -5,7 +5,7 @@ mod storage;
 mod support;
 mod theme;
 mod ui;
-pub const VERSION: &str = "2.3.1";
+pub const VERSION: &str = "2.3.4";
 fn main() {
     support::log(format!("Started {VERSION}"));
     std::panic::set_hook(Box::new(|info| {
@@ -17,6 +17,17 @@ fn main() {
     let args: Vec<_> = std::env::args().collect();
     if args.get(1).is_some_and(|x| x == "--dialog-test") {
         if let Err(e) = ui::dialog_test() {
+            support::log(e);
+            std::process::exit(1)
+        }
+        return;
+    }
+    if args.get(1).is_some_and(|x| x == "--render-hover-test") {
+        let path = args
+            .get(2)
+            .map(std::path::PathBuf::from)
+            .unwrap_or(support::folder().join("hover-preview.png"));
+        if let Err(e) = ui::render_hover_test(&path) {
             support::log(e);
             std::process::exit(1)
         }

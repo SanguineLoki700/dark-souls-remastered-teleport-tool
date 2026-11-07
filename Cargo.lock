@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "dark-souls-teleport"
-version = "2.3.1"
+version = "2.3.4"
 dependencies = [
  "embed-resource",
  "image",

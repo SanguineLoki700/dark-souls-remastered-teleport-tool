@@ -363,7 +363,7 @@ impl Game {
         {
             return Err("Another area transition is in progress. Wait for it to finish.".into());
         }
-        let previous_stable = self.read(manager + 0xba0, 0x35)?;
+        let previous_stable = self.read(manager + 0xba0, 0x36)?;
         let previous_request = self.read(manager + 0x1c, 8)?;
         let mut pose = [0u8; 32];
         for (offset, value) in [
@@ -375,18 +375,27 @@ impl Game {
         ] {
             pose[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
-        // The stage loader consumes this stable-pose override before creating the player.
-        // Ghidra: 1402514f0 -> 1402ca520/1402ca5c0 -> 1402c8e10/1402c8e50.
+        // BD5 stops the gameplay loop from replacing BA0/BB0 and BD0 with the
+        // outgoing player's stable position. The loader clears it in 2c9b50.
+        // Ghidra: 24f6b0 -> 2ca5a0 gates 2ca4b0/2ca4e0; 2514f0 consumes the pose.
         let staged = (|| {
-            self.write(manager + 0xba0, &pose)?;
-            self.write(manager + 0xbc0, &[1])?;
-            self.write(manager + 0xbd0, &target.to_le_bytes())?;
-            self.write(manager + 0xbd4, &[1])?;
+            self.write(manager + 0xbd5, &[1])?;
+            // Let an already-running stable-position update finish before staging.
+            thread::sleep(Duration::from_millis(40));
+            let mut stable = previous_stable.clone();
+            stable[..32].copy_from_slice(&pose);
+            stable[0x20] = 1;
+            stable[0x30..0x34].copy_from_slice(&target.to_le_bytes());
+            stable[0x34] = 1;
+            stable[0x35] = 1;
+            self.write(manager + 0xba0, &stable)?;
             let mut request = [0xffu8; 8];
             request[..4].copy_from_slice(&target.to_le_bytes());
             self.write(manager + 0x1c, &request)?;
             if self.snapshot()?.control != initial.control
                 || self.ptr(self.base + 0x1c74e08)? != manager
+                || self.byte(manager + 0xbd5)? != 1
+                || self.read(manager + 0xba0, 32)? != pose
             {
                 return Err("The character changed before the map request was sent.".to_owned());
             }
@@ -405,6 +414,7 @@ impl Game {
         ));
         let start = Instant::now();
         let mut stable = 0;
+        let mut last_trace = Instant::now() - Duration::from_secs(2);
         while start.elapsed() < Duration::from_secs(60) {
             thread::sleep(Duration::from_millis(100));
             if !self.alive() {
@@ -412,12 +422,32 @@ impl Game {
             }
             if let Ok(after) = self.snapshot() {
                 if after.position.map == Some(target)
+                    && point.y - after.position.y > 4.0
+                    && self.byte(manager + 0x19).unwrap_or(1) == 0
+                    && self.byte(manager + 0xbd4).unwrap_or(1) == 0
+                {
+                    crate::support::log(format!(
+                        "Destination ground missing: target={point:?} actual={:?}",
+                        after.position
+                    ));
+                    return Err("The destination ground did not finish loading.".into());
+                }
+                if last_trace.elapsed() >= Duration::from_secs(1) {
+                    crate::support::log(format!(
+                        "Stage progress: elapsed={} map={:?} position={:?} distance={} request={} override={} guard={}",
+                        start.elapsed().as_millis(), after.position.map, after.position,
+                        after.position.distance(point), self.byte(manager + 0x19).unwrap_or(255),
+                        self.byte(manager + 0xbd4).unwrap_or(255), self.byte(manager + 0xbd5).unwrap_or(255)
+                    ));
+                    last_trace = Instant::now();
+                }
+                if after.position.map == Some(target)
                     && after.position.distance(point) <= 1.0
                     && self.byte(manager + 0x19).unwrap_or(1) == 0
                     && self.byte(manager + 0xbd4).unwrap_or(1) == 0
                 {
                     stable += 1;
-                    if stable >= 5 {
+                    if stable >= 12 {
                         self.local_travel(point)?;
                         let confirmed = self.snapshot()?;
                         if confirmed.position.map == Some(target)

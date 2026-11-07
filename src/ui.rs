@@ -65,6 +65,7 @@ struct Ui {
     find: HWND,
     list: HWND,
     hover: HWND,
+    hover_row: Option<usize>,
     selected: Option<String>,
     hotkey_warning: bool,
     rows_key: String,
@@ -82,7 +83,7 @@ fn text(hwnd: HWND) -> String {
     }
 }
 unsafe fn child(parent: HWND, class: &str, label: &str, id: i32, r: RECT, style: u32) -> HWND {
-    CreateWindowExW(
+    let hwnd = CreateWindowExW(
         0,
         wide(class).as_ptr(),
         wide(label).as_ptr(),
@@ -95,12 +96,291 @@ unsafe fn child(parent: HWND, class: &str, label: &str, id: i32, r: RECT, style:
         id as usize as _,
         GetModuleHandleW(null()),
         null(),
-    )
+    );
+    if !hwnd.is_null() && class == "BUTTON" {
+        SetWindowSubclass(hwnd, Some(button_proc), 1, 0);
+    }
+    if !hwnd.is_null() && class == "LISTBOX" {
+        SetWindowSubclass(hwnd, Some(list_proc), 2, 0);
+    }
+    hwnd
 }
 unsafe fn enable(hwnd: HWND, on: bool) {
-    EnableWindow(hwnd, on as i32);
+    if (IsWindowEnabled(hwnd) != 0) != on {
+        EnableWindow(hwnd, on as i32);
+    }
+}
+
+type SubclassProc =
+    Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
+// windows-sys exposes these helpers under its larger Shell feature. The UI only
+// needs the three common-controls subclass functions, without adding that feature.
+#[link(name = "comctl32")]
+unsafe extern "system" {
+    fn SetWindowSubclass(hwnd: HWND, proc: SubclassProc, id: usize, data: usize) -> i32;
+    fn DefSubclassProc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT;
+    fn RemoveWindowSubclass(hwnd: HWND, proc: SubclassProc, id: usize) -> i32;
+}
+
+unsafe extern "system" fn button_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    match msg {
+        // Dialog navigation promotes focused buttons to default push buttons.
+        // Keep our owner-drawn type while preserving its keyboard behavior.
+        BM_SETSTYLE => DefSubclassProc(
+            hwnd,
+            msg,
+            (w & !(BS_TYPEMASK as usize)) | BS_OWNERDRAW as usize,
+            l,
+        ),
+        WM_STYLECHANGING if w as i32 == GWL_STYLE => {
+            let style = &mut *(l as *mut STYLESTRUCT);
+            style.styleNew = (style.styleNew & !(BS_TYPEMASK as u32)) | BS_OWNERDRAW as u32;
+            DefSubclassProc(hwnd, msg, w, l)
+        }
+        WM_ERASEBKGND => 1,
+        WM_SETCURSOR if (l as u32 & 65535) == HTCLIENT && IsWindowEnabled(hwnd) != 0 => {
+            SetCursor(LoadCursorW(null_mut(), IDC_HAND));
+            1
+        }
+        WM_NCDESTROY => {
+            RemoveWindowSubclass(hwnd, Some(button_proc), id);
+            DefSubclassProc(hwnd, msg, w, l)
+        }
+        _ => DefSubclassProc(hwnd, msg, w, l),
+    }
+}
+
+unsafe fn select_all_edit(hwnd: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let length = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+    if length != 4
+        || !class[..4]
+            .iter()
+            .zip("EDIT".encode_utf16())
+            .all(|(left, right)| (*left as u8).eq_ignore_ascii_case(&(right as u8)))
+    {
+        return false;
+    }
+    SendMessageW(hwnd, EM_SETSEL, 0, -1);
+    true
+}
+
+unsafe fn edit_shortcut(message: &MSG) -> bool {
+    message.message == WM_KEYDOWN
+        && message.wParam == b'A' as usize
+        && GetKeyState(VK_CONTROL as i32) < 0
+        && GetKeyState(VK_MENU as i32) >= 0
+        && select_all_edit(message.hwnd)
+}
+
+unsafe fn buffered_paint(dc: HDC, bounds: RECT, paint: impl FnOnce(HDC, RECT)) {
+    let width = bounds.right - bounds.left;
+    let height = bounds.bottom - bounds.top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let memory = CreateCompatibleDC(dc);
+    let bitmap = if memory.is_null() {
+        null_mut()
+    } else {
+        CreateCompatibleBitmap(dc, width, height)
+    };
+    if memory.is_null() || bitmap.is_null() {
+        if !memory.is_null() {
+            DeleteDC(memory);
+        }
+        paint(dc, bounds);
+        return;
+    }
+    let old = SelectObject(memory, bitmap);
+    SetWindowOrgEx(memory, bounds.left, bounds.top, null_mut());
+    paint(memory, bounds);
+    BitBlt(
+        dc,
+        bounds.left,
+        bounds.top,
+        width,
+        height,
+        memory,
+        bounds.left,
+        bounds.top,
+        SRCCOPY,
+    );
+    SelectObject(memory, old);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+}
+
+unsafe extern "system" fn list_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    let parent = GetParent(hwnd);
+    let pointer = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut Ui;
+    if pointer.is_null() {
+        return DefSubclassProc(hwnd, msg, w, l);
+    }
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            let mut ps = zeroed();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut bounds = zeroed();
+            GetClientRect(hwnd, &mut bounds);
+            buffered_paint(dc, bounds, |memory, r| (*pointer).paint_list(memory, r));
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_PRINTCLIENT => {
+            let mut bounds = zeroed();
+            GetClientRect(hwnd, &mut bounds);
+            (*pointer).paint_list(w as HDC, bounds);
+            0
+        }
+        WM_MOUSEMOVE => {
+            let ui = &mut *pointer;
+            let point = POINT {
+                x: (l as u16 as i16) as i32,
+                y: ((l >> 16) as u16 as i16) as i32,
+            };
+            ui.set_row_hover(ui.row_at(point));
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut tracking);
+            DefSubclassProc(hwnd, msg, w, l)
+        }
+        WM_MOUSELEAVE => {
+            (*pointer).set_row_hover(None);
+            DefSubclassProc(hwnd, msg, w, l)
+        }
+        WM_MOUSEWHEEL | WM_VSCROLL => {
+            let result = DefSubclassProc(hwnd, msg, w, l);
+            let mut point = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut point);
+            ScreenToClient(hwnd, &mut point);
+            let ui = &mut *pointer;
+            ui.set_row_hover(ui.row_at(point));
+            InvalidateRect(hwnd, null(), 0);
+            result
+        }
+        WM_SETCURSOR if (l as u32 & 65535) == HTCLIENT => {
+            let mut point = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut point);
+            ScreenToClient(hwnd, &mut point);
+            SetCursor(LoadCursorW(
+                null_mut(),
+                if (*pointer).row_at(point).is_some() {
+                    IDC_HAND
+                } else {
+                    IDC_ARROW
+                },
+            ));
+            1
+        }
+        WM_NCDESTROY => {
+            RemoveWindowSubclass(hwnd, Some(list_proc), id);
+            DefSubclassProc(hwnd, msg, w, l)
+        }
+        _ => DefSubclassProc(hwnd, msg, w, l),
+    }
 }
 impl Ui {
+    unsafe fn row_at(&self, point: POINT) -> Option<usize> {
+        let packed = (point.x as u16 as u32 | ((point.y as u16 as u32) << 16)) as isize;
+        let hit = SendMessageW(self.list, LB_ITEMFROMPOINT, 0, packed) as u32;
+        let index = (hit & 65535) as usize;
+        if (hit >> 16) != 0 || index >= self.view.rows.len() {
+            return None;
+        }
+        let mut bounds = zeroed();
+        if SendMessageW(
+            self.list,
+            LB_GETITEMRECT,
+            index,
+            &mut bounds as *mut RECT as isize,
+        ) == LB_ERR as isize
+            || PtInRect(&bounds, point) == 0
+        {
+            return None;
+        }
+        Some(index)
+    }
+
+    unsafe fn set_row_hover(&mut self, hover: Option<usize>) {
+        if hover == self.hover_row {
+            return;
+        }
+        let previous = self.hover_row;
+        self.hover_row = hover;
+        for index in [previous, hover].into_iter().flatten() {
+            let mut bounds = zeroed();
+            if SendMessageW(
+                self.list,
+                LB_GETITEMRECT,
+                index,
+                &mut bounds as *mut RECT as isize,
+            ) != LB_ERR as isize
+            {
+                InvalidateRect(self.list, &bounds, 0);
+            }
+        }
+    }
+
+    unsafe fn paint_row(&mut self, dc: HDC, r: RECT, index: usize) {
+        self.theme.leather(dc, r);
+        if let Some(row) = self.view.rows.get(index) {
+            let selected = self.selected.as_ref() == Some(&row.id);
+            if selected || self.hover_row == Some(index) {
+                self.theme.selected(dc, r);
+            }
+            self.theme.line(dc, r);
+            let mut label = r;
+            label.left += if selected { 22 } else { 12 };
+            if selected {
+                self.theme
+                    .text(dc, ">", rect(r.left + 5, r.top, 14, 29), 19, GOLD, false);
+            }
+            self.theme.text(dc, &row.name, label, 19, TEXT, false);
+        } else if self.view.rows.is_empty() {
+            self.theme
+                .text(dc, "No locations saved", r, 20, MUTED, true);
+        }
+    }
+
+    unsafe fn paint_list(&mut self, dc: HDC, bounds: RECT) {
+        self.theme.leather(dc, bounds);
+        let top = SendMessageW(self.list, LB_GETTOPINDEX, 0, 0).max(0) as usize;
+        let count = SendMessageW(self.list, LB_GETCOUNT, 0, 0).max(0) as usize;
+        for index in top..count {
+            let mut item: RECT = zeroed();
+            if SendMessageW(
+                self.list,
+                LB_GETITEMRECT,
+                index,
+                &mut item as *mut RECT as isize,
+            ) == LB_ERR as isize
+                || item.top >= bounds.bottom
+            {
+                break;
+            }
+            self.paint_row(dc, item, index);
+        }
+    }
     unsafe fn send(&self, command: Command) {
         let _ = self.commands.send(command);
     }
@@ -162,52 +442,8 @@ impl Ui {
             self.view = view;
             changed = true;
         }
+        self.sync_rows(changed);
         if changed {
-            let key = format!(
-                "{}:{}:{}",
-                self.view.page,
-                self.view.filtered,
-                self.view
-                    .rows
-                    .iter()
-                    .map(|x| format!("{}:{}", x.id, x.name))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-            if key != self.rows_key {
-                self.rows_key = key;
-                SendMessageW(self.list, WM_SETREDRAW, 0, 0);
-                SendMessageW(self.list, LB_RESETCONTENT, 0, 0);
-                for row in &self.view.rows {
-                    SendMessageW(
-                        self.list,
-                        LB_ADDSTRING,
-                        0,
-                        wide(&row.name).as_ptr() as isize,
-                    );
-                }
-                let index = self
-                    .selected
-                    .as_ref()
-                    .and_then(|id| self.view.rows.iter().position(|x| &x.id == id))
-                    .or_else(|| (!self.view.rows.is_empty()).then_some(0));
-                if self.view.rows.is_empty() {
-                    SendMessageW(
-                        self.list,
-                        LB_ADDSTRING,
-                        0,
-                        wide("No locations saved").as_ptr() as isize,
-                    );
-                }
-                if let Some(index) = index {
-                    self.selected = Some(self.view.rows[index].id.clone());
-                    SendMessageW(self.list, LB_SETCURSEL, index, 0);
-                } else {
-                    self.selected = None;
-                }
-                SendMessageW(self.list, WM_SETREDRAW, 1, 0);
-                InvalidateRect(self.list, null(), 0);
-            }
             let b = !self.view.busy;
             for id in [CAP, SAVE] {
                 enable(GetDlgItem(self.hwnd, id), b && self.view.connected);
@@ -248,7 +484,10 @@ impl Ui {
         let mut point = POINT { x: 0, y: 0 };
         GetCursorPos(&mut point);
         let found = WindowFromPoint(point);
-        let h = if !found.is_null() && GetParent(found) == self.hwnd {
+        let h = if !found.is_null()
+            && GetParent(found) == self.hwnd
+            && (CAP..=RECONNECT).contains(&GetDlgCtrlID(found))
+        {
             found
         } else {
             null_mut()
@@ -272,6 +511,58 @@ impl Ui {
             if self.search_ticks == 0 {
                 self.send(Command::Filter(self.search.clone()));
             }
+        }
+    }
+    unsafe fn sync_rows(&mut self, changed: bool) {
+        let count = SendMessageW(self.list, LB_GETCOUNT, 0, 0);
+        if !changed && count == self.view.rows.len().max(1) as isize {
+            return;
+        }
+        let key = format!(
+            "{}:{}:{}",
+            self.view.page,
+            self.view.filtered,
+            self.view
+                .rows
+                .iter()
+                .map(|x| format!("{}:{}", x.id, x.name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        if key != self.rows_key || count != self.view.rows.len().max(1) as isize {
+            self.rows_key = key;
+            self.hover_row = None;
+            SendMessageW(self.list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.list, LB_RESETCONTENT, 0, 0);
+            for row in &self.view.rows {
+                SendMessageW(
+                    self.list,
+                    LB_ADDSTRING,
+                    0,
+                    wide(&row.name).as_ptr() as isize,
+                );
+            }
+            let index = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.view.rows.iter().position(|x| &x.id == id))
+                .or_else(|| (!self.view.rows.is_empty()).then_some(0));
+            if self.view.rows.is_empty() {
+                SendMessageW(
+                    self.list,
+                    LB_ADDSTRING,
+                    0,
+                    wide("No locations saved").as_ptr() as isize,
+                );
+            }
+            if let Some(index) = index {
+                self.selected = Some(self.view.rows[index].id.clone());
+                SendMessageW(self.list, LB_SETCURSEL, index, 0);
+            } else {
+                self.selected = None;
+            }
+            SendMessageW(self.list, WM_SETREDRAW, 1, 0);
+            RedrawWindow(self.list, null(), null_mut(), RDW_INVALIDATE | RDW_NOERASE);
         }
     }
     unsafe fn paint(&mut self, dc: HDC) {
@@ -435,6 +726,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
         }
         WM_ERASEBKGND => 1,
+        WM_PRINTCLIENT => {
+            ui.paint(w as HDC);
+            0
+        }
         WM_PAINT => {
             let mut ps = zeroed();
             let dc = BeginPaint(hwnd, &mut ps);
@@ -483,36 +778,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             let draw = &*(l as *const DRAWITEMSTRUCT);
             let r = draw.rcItem;
             if draw.CtlID == LIST as u32 {
-                ui.theme.leather(draw.hDC, r);
-                if draw.itemID != u32::MAX {
-                    let i = draw.itemID as usize;
-                    if let Some(row) = ui.view.rows.get(i) {
-                        let selected = ui.selected.as_ref() == Some(&row.id);
-                        if selected {
-                            ui.theme.selected(draw.hDC, r);
-                        }
-                        ui.theme.line(draw.hDC, r);
-                        let mut label = r;
-                        label.left += if selected { 22 } else { 12 };
-                        if selected {
-                            ui.theme.text(
-                                draw.hDC,
-                                ">",
-                                rect(r.left + 5, r.top, 14, 29),
-                                19,
-                                GOLD,
-                                false,
-                            );
-                        }
-                        ui.theme.text(draw.hDC, &row.name, label, 19, TEXT, false);
-                    } else {
-                        ui.theme
-                            .text(draw.hDC, "No locations saved", r, 20, MUTED, true);
-                    }
-                } else {
-                    ui.theme
-                        .text(draw.hDC, "No locations saved", r, 20, MUTED, true);
-                }
+                buffered_paint(draw.hDC, r, |dc, bounds| {
+                    ui.paint_row(dc, bounds, draw.itemID as usize);
+                });
             } else {
                 let label = text(draw.hwndItem);
                 let id = draw.CtlID as i32;
@@ -540,6 +808,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_CTLCOLORLISTBOX => {
             SetTextColor(w as HDC, TEXT);
             SetBkMode(w as HDC, TRANSPARENT as i32);
+            ui.theme.list_brush as isize
+        }
+        WM_CTLCOLORBTN => {
+            SetTextColor(w as HDC, TEXT);
+            SetBkColor(w as HDC, rgb(10, 10, 9));
             ui.theme.list_brush as isize
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
@@ -767,7 +1040,7 @@ impl Popup {
     }
     unsafe fn command(&mut self, id: i32) {
         if id == 322 {
-            DestroyWindow(self.hwnd);
+            close_popup(self.hwnd);
             return;
         }
         if self.diagnostics {
@@ -807,7 +1080,8 @@ impl Popup {
                                     .commands
                                     .send(Command::ManualSave(text(self.inputs[0]), point));
                             }
-                            DestroyWindow(self.hwnd);
+                            close_popup(self.hwnd);
+                            return;
                         }
                     }
                 },
@@ -815,6 +1089,35 @@ impl Popup {
             }
         }
         InvalidateRect(self.hwnd, null(), 0);
+    }
+}
+unsafe fn close_popup(hwnd: HWND) {
+    let owner = GetWindow(hwnd, GW_OWNER);
+    let reactivate = GetForegroundWindow() == hwnd;
+    if !owner.is_null() && IsWindow(owner) != 0 {
+        EnableWindow(owner, 1);
+        if reactivate && !UI_TEST.load(Ordering::Relaxed) {
+            SetActiveWindow(owner);
+        }
+    }
+    DestroyWindow(hwnd);
+    if IsWindow(owner) != 0 {
+        RedrawWindow(
+            owner,
+            null(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+    }
+    if reactivate && !UI_TEST.load(Ordering::Relaxed) && IsWindow(owner) != 0 {
+        if IsIconic(owner) != 0 {
+            ShowWindow(owner, SW_RESTORE);
+        }
+        SetForegroundWindow(owner);
+        let focus = GetNextDlgTabItem(owner, null_mut(), 0);
+        if !focus.is_null() {
+            SetFocus(focus);
+        }
     }
 }
 unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -865,6 +1168,11 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             );
             1
         }
+        WM_CTLCOLORBTN => {
+            SetTextColor(w as HDC, TEXT);
+            SetBkColor(w as HDC, rgb(10, 10, 9));
+            p.theme.list_brush as isize
+        }
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
             SetTextColor(w as HDC, TEXT);
             SetBkColor(
@@ -878,7 +1186,7 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             p.brush as isize
         }
         WM_CLOSE => {
-            DestroyWindow(hwnd);
+            close_popup(hwnd);
             0
         }
         WM_DESTROY => {
@@ -1026,21 +1334,53 @@ pub fn dialog_test() -> Result<(), String> {
     UI_TEST.store(true, Ordering::Relaxed);
     run_inner(true)
 }
+struct InstanceGuard(Vec<HANDLE>);
+impl InstanceGuard {
+    unsafe fn new(testing: bool) -> Result<Self, String> {
+        let names: &[&str] = if testing {
+            &["Local\\DarkSoulsCheckpoints.DialogTest"]
+        } else {
+            &[
+                "Local\\DarkSoulsCheckpoints.SingleInstance",
+                "Local\\DarkSoulsCheckpoints.SingleInstance.Rust",
+            ]
+        };
+        let mut guard = Self(vec![]);
+        for name in names {
+            let handle =
+                windows_sys::Win32::System::Threading::CreateMutexW(null(), 0, wide(name).as_ptr());
+            if handle.is_null() {
+                return Err(format!(
+                    "Could not open the tool: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let existing = GetLastError() == ERROR_ALREADY_EXISTS;
+            guard.0.push(handle);
+            if existing {
+                return Err(
+                    "Dark Souls Remastered Teleport is already open. Close the other copy first."
+                        .into(),
+                );
+            }
+        }
+        Ok(guard)
+    }
+}
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            unsafe {
+                CloseHandle(*handle);
+            }
+        }
+    }
+}
 fn run_inner(testing: bool) -> Result<(), String> {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
         let instance = GetModuleHandleW(null());
-        let mutex_name = wide(if testing {
-            "Local\\DarkSoulsCheckpoints.DialogTest"
-        } else {
-            "Local\\DarkSoulsCheckpoints.SingleInstance.Rust"
-        });
-        let mutex =
-            windows_sys::Win32::System::Threading::CreateMutexW(null(), 0, mutex_name.as_ptr());
-        if !mutex.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
-            CloseHandle(mutex);
-            return Err("Dark Souls Remastered Teleport is already open.".into());
-        }
+        let _instance = InstanceGuard::new(testing)?;
         for (name, proc) in [
             (
                 "SoulsTeleport",
@@ -1068,7 +1408,14 @@ fn run_inner(testing: bool) -> Result<(), String> {
                 ));
             }
         }
-        let (commands, events) = crate::app::spawn();
+        let (test_events, events) = std::sync::mpsc::channel();
+        let (commands, unused_commands) = std::sync::mpsc::channel();
+        let (commands, events) = if testing {
+            (commands, events)
+        } else {
+            crate::app::spawn()
+        };
+        let _keep_test_commands = unused_commands;
         let mut ui = Box::new(Ui {
             hwnd: null_mut(),
             theme: Theme::new(),
@@ -1079,6 +1426,7 @@ fn run_inner(testing: bool) -> Result<(), String> {
             find: null_mut(),
             list: null_mut(),
             hover: null_mut(),
+            hover_row: None,
             selected: None,
             hotkey_warning: false,
             rows_key: String::new(),
@@ -1113,6 +1461,82 @@ fn run_inner(testing: bool) -> Result<(), String> {
             ));
         }
         if testing {
+            if InstanceGuard::new(true).is_ok() {
+                return Err("The single-instance guard allowed a second copy.".into());
+            }
+            for (id, _, _) in buttons() {
+                check_button_background(hwnd, id)?;
+            }
+            check_edit_selection(ui.name)?;
+            check_edit_selection(ui.find)?;
+            let point = Position {
+                area: 102000,
+                x: 1.,
+                y: 2.,
+                z: 3.,
+                angle: 0.,
+                map: Some(0x0a020000),
+            };
+            for (total, page, visible) in [
+                (2, 0, 2),
+                (3, 0, 3),
+                (100000, 0, 50),
+                (100000, 1999, 50),
+                (1, 0, 1),
+                (0, 0, 0),
+            ] {
+                let rows = (0..visible)
+                    .map(|i| Location {
+                        id: format!("row-{}", page * 50 + i),
+                        name: format!("Location {:06}", page * 50 + i),
+                        position: point,
+                        created: String::new(),
+                    })
+                    .collect();
+                let view = View {
+                    rows,
+                    total,
+                    filtered: total,
+                    page,
+                    pages: total.div_ceil(50).max(1),
+                    ..View::default()
+                };
+                test_events
+                    .send(Event::Snapshot(view))
+                    .map_err(|e| e.to_string())?;
+                ui.update();
+                if SendMessageW(ui.list, LB_GETCOUNT, 0, 0) != visible.max(1) as isize {
+                    return Err("The saved-location list lost rows after an update.".into());
+                }
+                if visible > 0 {
+                    let mut name = vec![0u16; 128];
+                    SendMessageW(ui.list, LB_GETTEXT, visible - 1, name.as_mut_ptr() as isize);
+                    let len = name.iter().position(|x| *x == 0).unwrap_or(name.len());
+                    if String::from_utf16_lossy(&name[..len])
+                        != format!("Location {:06}", page * 50 + visible - 1)
+                    {
+                        return Err("The saved-location list displayed the wrong page.".into());
+                    }
+                }
+                if visible > 1 {
+                    let selected = ui.selected.clone();
+                    SendMessageW(ui.list, WM_MOUSEMOVE, 0, 10 | (43 << 16));
+                    if ui.hover_row != Some(1) || ui.selected != selected {
+                        return Err("Hovering a saved location changed its selection or lost its highlight.".into());
+                    }
+                    SendMessageW(ui.list, WM_MOUSELEAVE, 0, 0);
+                    if ui.hover_row.is_some() || ui.selected != selected {
+                        return Err("Leaving the saved-location list did not restore its persistent selection.".into());
+                    }
+                }
+                SendMessageW(ui.list, LB_RESETCONTENT, 0, 0);
+                ui.update();
+                if SendMessageW(ui.list, LB_GETCOUNT, 0, 0) != visible.max(1) as isize {
+                    return Err(
+                        "The saved-location list did not recover a cleared native control.".into(),
+                    );
+                }
+            }
             ui.view.diagnostics="Connected to Dark Souls Remastered.\r\n\r\n1 saved location loaded.\r\n\r\nA shortcut is in use by another program. Close the other teleport tool or use the buttons.".into();
             for i in 0..40 {
                 crate::support::log(format!("Dialog regression {i}"));
@@ -1127,6 +1551,20 @@ fn run_inner(testing: bool) -> Result<(), String> {
                 }
                 if diagnostic && text(control) != ui.view.diagnostics {
                     return Err("Diagnostics text was lost.".into());
+                }
+                if diagnostic {
+                    check_edit_selection(control)?;
+                } else {
+                    for id in 301..=304 {
+                        check_edit_selection(GetDlgItem(dialog, id))?;
+                    }
+                }
+                for id in if diagnostic {
+                    &[320, 321, 322][..]
+                } else {
+                    &[319, 320, 321, 322][..]
+                } {
+                    check_button_background(dialog, *id)?;
                 }
                 if i < 2 {
                     print_dialog(
@@ -1147,23 +1585,36 @@ fn run_inner(testing: bool) -> Result<(), String> {
                     );
                     DeleteDC(dc);
                 }
-                DestroyWindow(dialog);
+                EnableWindow(hwnd, 0);
+                match i % 3 {
+                    0 => {
+                        SendMessageW(dialog, WM_CLOSE, 0, 0);
+                    }
+                    1 => {
+                        let pointer = GetWindowLongPtrW(dialog, GWLP_USERDATA) as *mut Popup;
+                        (*pointer).command(322);
+                    }
+                    _ => close_popup(dialog),
+                }
+                if IsWindow(dialog) != 0 || IsWindowEnabled(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                    return Err("Closing the dialog did not restore its owner window.".into());
+                }
             }
             DestroyWindow(hwnd);
             DeleteObject(ui.brush);
-            if !mutex.is_null() {
-                CloseHandle(mutex);
-            }
-            crate::support::log("PASS: 40 diagnostics/coordinates open-close cycles");
+            crate::support::log("PASS: saved-location list updates, 100000-location pagination, cleared-list recovery and 40 diagnostics/coordinates open-close cycles");
             return Ok(());
         }
         ShowWindow(hwnd, SW_SHOW);
         let mut msg = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if edit_shortcut(&msg) {
+                continue;
+            }
             let root = GetAncestor(msg.hwnd, GA_ROOT);
             if root != hwnd && GetWindow(root, GW_OWNER) == hwnd {
                 if msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE as usize {
-                    DestroyWindow(root);
+                    close_popup(root);
                     continue;
                 }
                 if msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN as usize {
@@ -1203,14 +1654,89 @@ fn run_inner(testing: bool) -> Result<(), String> {
             }
         }
         DeleteObject(ui.brush);
-        if !mutex.is_null() {
-            CloseHandle(mutex);
-        }
         Ok(())
     }
 }
 
+unsafe fn check_button_background(parent: HWND, id: i32) -> Result<(), String> {
+    let button = GetDlgItem(parent, id);
+    for requested in [BS_DEFPUSHBUTTON, BS_PUSHBUTTON] {
+        SendMessageW(button, BM_SETSTYLE, requested as usize, 1);
+        if GetWindowLongPtrW(button, GWL_STYLE) as u32 & BS_TYPEMASK as u32 != BS_OWNERDRAW as u32 {
+            return Err(format!(
+                "Dialog navigation replaced the custom style of button {id}."
+            ));
+        }
+    }
+    let dc = CreateCompatibleDC(null_mut());
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: 300,
+            biHeight: -50,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut pixels = null_mut();
+    let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut pixels, null_mut(), 0);
+    if bitmap.is_null() || pixels.is_null() {
+        DeleteDC(dc);
+        return Err("Could not create the button paint test surface.".into());
+    }
+    let old = SelectObject(dc, bitmap);
+    let dark = CreateSolidBrush(rgb(20, 20, 18));
+    FillRect(dc, &rect(0, 0, 300, 50), dark);
+    DeleteObject(dark);
+    let brush = SendMessageW(parent, WM_CTLCOLORBTN, dc as usize, button as isize) as HBRUSH;
+    FillRect(dc, &rect(0, 0, 300, 50), brush);
+    SendMessageW(button, WM_ERASEBKGND, dc as usize, 0);
+    let color = GetPixel(dc, 4, 4);
+    SelectObject(dc, old);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    if (color & 255) > 180 && ((color >> 8) & 255) > 180 && ((color >> 16) & 255) > 180 {
+        return Err(format!(
+            "Button {id} exposed a light system background before painting: #{color:06x}"
+        ));
+    }
+    Ok(())
+}
+
+unsafe fn check_edit_selection(control: HWND) -> Result<(), String> {
+    let original = text(control);
+    if original.is_empty() {
+        SetWindowTextW(control, wide("Select all regression").as_ptr());
+    }
+    let mut start = 0u32;
+    let mut end = 0u32;
+    let handled = select_all_edit(control);
+    SendMessageW(
+        control,
+        EM_GETSEL,
+        &mut start as *mut u32 as usize,
+        &mut end as *mut u32 as isize,
+    );
+    let expected = GetWindowTextLengthW(control) as u32;
+    if original.is_empty() {
+        SetWindowTextW(control, wide("").as_ptr());
+    }
+    if !handled || start != 0 || end != expected {
+        return Err("An editable or read-only text field did not select all its text.".into());
+    }
+    Ok(())
+}
+
 pub fn render_test(path: &std::path::Path) -> Result<(), String> {
+    render_preview(path, false)
+}
+pub fn render_hover_test(path: &std::path::Path) -> Result<(), String> {
+    render_preview(path, true)
+}
+fn render_preview(path: &std::path::Path, hover: bool) -> Result<(), String> {
     unsafe {
         let (tx, _) = std::sync::mpsc::channel();
         let (_, rx) = std::sync::mpsc::channel();
@@ -1228,6 +1754,7 @@ pub fn render_test(path: &std::path::Path) -> Result<(), String> {
             find: null_mut(),
             list: null_mut(),
             hover: null_mut(),
+            hover_row: None,
             selected: None,
             hotkey_warning: false,
             rows_key: String::new(),
@@ -1266,7 +1793,8 @@ pub fn render_test(path: &std::path::Path) -> Result<(), String> {
             } else {
                 20
             };
-            ui.theme.button(dc, r, false, label, size, true);
+            ui.theme
+                .button(dc, r, hover && id == CAP, label, size, true);
         }
         ui.theme.leather(dc, rect(36, 350, 528, 174));
         ui.theme.text(
