@@ -375,12 +375,10 @@ impl Game {
         ] {
             pose[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
-        // BD5 stops the gameplay loop from replacing BA0/BB0 and BD0 with the
-        // outgoing player's stable position. The loader clears it in 2c9b50.
-        // Ghidra: 24f6b0 -> 2ca5a0 gates 2ca4b0/2ca4e0; 2514f0 consumes the pose.
+        // Freeze the saved destination until the loader consumes it and clears BD5.
         let staged = (|| {
             self.write(manager + 0xbd5, &[1])?;
-            // Let an already-running stable-position update finish before staging.
+            // Allow an in-flight position update to finish.
             thread::sleep(Duration::from_millis(40));
             let mut stable = previous_stable.clone();
             stable[..32].copy_from_slice(&pose);

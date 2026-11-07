@@ -113,8 +113,6 @@ unsafe fn enable(hwnd: HWND, on: bool) {
 
 type SubclassProc =
     Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT>;
-// windows-sys exposes these helpers under its larger Shell feature. The UI only
-// needs the three common-controls subclass functions, without adding that feature.
 #[link(name = "comctl32")]
 unsafe extern "system" {
     fn SetWindowSubclass(hwnd: HWND, proc: SubclassProc, id: usize, data: usize) -> i32;
@@ -131,8 +129,7 @@ unsafe extern "system" fn button_proc(
     _: usize,
 ) -> LRESULT {
     match msg {
-        // Dialog navigation promotes focused buttons to default push buttons.
-        // Keep our owner-drawn type while preserving its keyboard behavior.
+        // Keep dialog navigation from replacing the custom button style.
         BM_SETSTYLE => DefSubclassProc(
             hwnd,
             msg,

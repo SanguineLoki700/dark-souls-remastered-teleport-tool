@@ -18,12 +18,10 @@ For bug reports, open **Diagnostics**, click **Save support log**, and attach th
 
 The ZIP contains the executable and one LICENSES.txt file with the font and library notices.
 
-Version 2.3.4 fixes destinations being overwritten during map loading, list flicker, button styling and Ctrl+A in text fields. Locations now highlight under the mouse. Firelink Altar and Sanctuary Garden were tested in both directions.
-
 Build on Windows with Rust and the MSVC build tools:
 
 ```powershell
 cargo build --release --locked
 ```
 
-The executable is in `target/release`. The interface includes [EB Garamond](https://github.com/octaviopardo/EBGaramond12) under the [SIL Open Font License](FONT-LICENSE.txt). Dark Souls artwork belongs to its respective owners.
+The executable is in `target/release`. Font and library notices are in [LICENSES.txt](LICENSES.txt). Dark Souls artwork belongs to its respective owners.
